@@ -1,0 +1,100 @@
+name: Status Check
+
+on:
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+
+concurrency:
+  group: >-
+    ${{ github.workflow }}-
+    ${{ github.event.pull_request.head.repo.full_name || github.repository }}-
+    ${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  status-check:
+    name: Status Check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      pull-requests: read
+      checks: read
+      statuses: read
+    steps:
+      - name: Get job context
+        id: get-context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          job_run_id: ${{ job.check_run_id }}
+        run: |
+          until names_tuple="$( \
+            gh api "/repos/{owner}/{repo}/actions/jobs/${job_run_id}" \
+              --jq '[.workflow_name, .name]' \
+          )"; do
+            sleep 30
+          done
+
+          workflow_name="$(jq -cr '.[0]' <<< "$names_tuple")"
+          job_name="$(jq -cr '.[1]' <<< "$names_tuple")"
+
+          echo "workflow-name=${workflow_name}" >> "$GITHUB_OUTPUT"
+          echo "job-name=${job_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Watch PR Checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          pr_number: ${{ github.event.number }}
+          exclude_workflow_name: ${{ steps.get-context.outputs.workflow-name }}
+          exclude_job_name: ${{ steps.get-context.outputs.job-name }}
+        run: |
+          while true; do
+
+            until checks_json="$( \
+              gh pr checks "$pr_number" \
+                --json bucket,name,workflow \
+            )"; do
+              sleep 30
+            done
+
+            checks_state="$(\
+              jq -cr \
+                --arg exclude_workflow "$exclude_workflow_name" \
+                --arg exclude_job "$exclude_job_name" \
+                '
+                  map(
+                    select(
+                      .workflow != "" and
+                      ((
+                        .workflow == $exclude_workflow and
+                        .name == $exclude_job
+                      ) | not)
+                    )
+                  )
+                  | {
+                    has_fail: any(.[]; .bucket == "fail" or .bucket == "cancel"),
+                    has_pending: any(.[]; .bucket == "pending"),
+                  }
+                  | if .has_fail then "fail"
+                    elif .has_pending then "pending"
+                    else "done"
+                    end
+                ' <<< "$checks_json" \
+            )"
+
+            case "$checks_state" in
+              fail)    exit 1 ;;
+              done)    exit 0 ;;
+              pending) sleep 15 ;;
+            esac
+
+          done
